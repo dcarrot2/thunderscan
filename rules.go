@@ -42,6 +42,7 @@ type rule struct {
 	Strings []string // case-insensitive substring of string literals
 	Idents  []string // exact identifier in the #Strings heap
 	TextToo bool     // also apply Strings to plain-text files (configs, scripts)
+	Word    bool     // Strings must stand alone: no letter/digit right before or after (so "cscript" doesn't match "MiscScripts")
 
 	// Matchers for code that splits or hides its strings.
 	Exact  []string   // a whole string literal equals this (case-insensitive; ", Assembly" suffix ignored)
@@ -57,6 +58,7 @@ var rules = []rule{
 		Members: []string{"System.Diagnostics.Process::Start"}, Types: []string{"System.Diagnostics.ProcessStartInfo"}},
 	{ID: "SHELL_STRINGS", Sev: High, Title: "References Windows shells / LOLBins",
 		Why:     "Contains command-line tool names commonly abused to run payloads.",
+		Word:    true,
 		Strings: []string{"cmd.exe", "cmd /c", "powershell", "pwsh", "-encodedcommand", "wscript", "cscript", "mshta", "rundll32", "regsvr32", "certutil", "bitsadmin", "schtasks", "vssadmin", "wmic ", "reg add", "Add-MpPreference", "Set-MpPreference"}},
 	{ID: "NATIVE_EXEC", Sev: High, Title: "Native process execution API",
 		Why:     "Imports Win32 functions that start processes directly.",
@@ -288,14 +290,40 @@ func matchRule(r *rule, s *signals, textOnly bool) []string {
 		for _, needle := range r.Strings {
 			nl := strings.ToLower(needle)
 			for i, l := range s.lower {
-				if strings.Contains(l, nl) {
-					add(snippet(s.strs[i], strings.Index(l, nl), len(nl)))
+				at := strings.Index(l, nl)
+				if r.Word {
+					at = indexWord(l, nl)
+				}
+				if at >= 0 {
+					add(snippet(s.strs[i], at, len(nl)))
 					break
 				}
 			}
 		}
 	}
 	return ev
+}
+
+// indexWord finds needle in s where it is not glued to letters/digits on an
+// edge that is itself a letter/digit ("\cmd.exe" and "cscript //b" match;
+// "MiscScripts" and "WindowsPowerShell" don't). It checks every occurrence.
+func indexWord(s, needle string) int {
+	alnum := func(c byte) bool { return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' }
+	for off := 0; off <= len(s)-len(needle); {
+		i := strings.Index(s[off:], needle)
+		if i < 0 {
+			return -1
+		}
+		i += off
+		end := i + len(needle)
+		okL := i == 0 || !alnum(needle[0]) || !alnum(s[i-1])
+		okR := end == len(s) || !alnum(needle[len(needle)-1]) || !alnum(s[end])
+		if okL && okR {
+			return i
+		}
+		off = i + 1
+	}
+	return -1
 }
 
 func snippet(s string, at, n int) string {

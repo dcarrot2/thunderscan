@@ -52,6 +52,31 @@ func TestStartupFolderIL(t *testing.T) {
 	}
 }
 
+func TestShellStringsWholeWord(t *testing.T) {
+	var r *rule
+	for i := range rules {
+		if rules[i].ID == "SHELL_STRINGS" {
+			r = &rules[i]
+		}
+	}
+	hit := []string{`C:\Windows\System32\cmd.exe`, "cscript //nologo x.vbs", `\WindowsPowerShell\v1.0\powershell.exe`, "run pwsh -c"}
+	miss := []string{"CodeRebirth.src.MiscScripts.WeatherController:Start", "WindowsPowerShellHelper", "rundll32x"}
+	for _, x := range hit {
+		s := newSignals()
+		s.addStrings([]string{x})
+		if len(matchRule(r, s, false)) == 0 {
+			t.Errorf("should match: %q", x)
+		}
+	}
+	for _, x := range miss {
+		s := newSignals()
+		s.addStrings([]string{x})
+		if ev := matchRule(r, s, false); len(ev) > 0 {
+			t.Errorf("false positive on %q: %v", x, ev)
+		}
+	}
+}
+
 func TestSplitAndExactMatchers(t *testing.T) {
 	s := newSignals()
 	s.addStrings([]string{"discord", "Local Storage", "leveldb", "WebClient, System", "updater.exe"})
