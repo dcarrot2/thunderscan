@@ -22,7 +22,8 @@ type clrMeta struct {
 	StringHeap    []string
 	UserStrings   []string
 	ResourcesData []byte
-	ParseErr      error // table stream problem; heaps may still be populated
+	ILFacts       map[string]bool // facts from scanning method bodies, e.g. "GETFOLDERPATH_STARTUP"
+	ParseErr      error           // table stream problem; heaps may still be populated
 }
 
 func le16(b []byte) uint16 { return binary.LittleEndian.Uint16(b) }
@@ -128,7 +129,14 @@ func parseCLR(f *pe.File, data []byte) (*clrMeta, error) {
 		m.ParseErr = errors.New("no metadata table stream")
 		return m, nil
 	}
-	if err := parseTables(m, tbl, strs); err != nil {
+	at := func(rva uint32) []byte {
+		o, ok := rvaToOffset(f, rva)
+		if !ok || int(o) >= len(data) {
+			return nil
+		}
+		return data[o:]
+	}
+	if err := parseTables(m, tbl, strs, at); err != nil {
 		m.ParseErr = err
 	}
 	return m, nil
@@ -309,7 +317,7 @@ func bitsFor(n int) uint {
 	return b
 }
 
-func parseTables(m *clrMeta, t []byte, strs []byte) error {
+func parseTables(m *clrMeta, t []byte, strs []byte, at func(rva uint32) []byte) error {
 	if len(t) < 24 {
 		return errors.New("table stream truncated")
 	}
@@ -467,6 +475,25 @@ func parseTables(m *clrMeta, t []byte, strs []byte) error {
 		}
 	}
 
+	// Method-body scan: which constants are passed to Environment.GetFolderPath?
+	getFolder := map[uint32]bool{}
+	for r, name := range m.MemberRefs {
+		if name == "System.Environment::GetFolderPath" {
+			getFolder[0x0A000000|uint32(r+1)] = true
+		}
+	}
+	if len(getFolder) > 0 && md != nil && at != nil {
+		for r := 0; r < md.rows; r++ {
+			if code := methodCode(at(md.get(r, 0))); code != nil && callsWithStartupFolder(code, getFolder) {
+				if m.ILFacts == nil {
+					m.ILFacts = map[string]bool{}
+				}
+				m.ILFacts["GETFOLDERPATH_STARTUP"] = true
+				break
+			}
+		}
+	}
+
 	if mod := tables[0x1A]; mod != nil {
 		for r := 0; r < mod.rows; r++ {
 			m.ModuleRefs = append(m.ModuleRefs, getStr(mod.get(r, 0)))
@@ -478,4 +505,74 @@ func parseTables(m *clrMeta, t []byte, strs []byte) error {
 		}
 	}
 	return nil
+}
+
+// methodCode returns the IL bytes of a method body (tiny or fat header), or nil.
+func methodCode(b []byte) []byte {
+	if len(b) < 1 {
+		return nil
+	}
+	switch b[0] & 3 {
+	case 2: // tiny
+		n := int(b[0] >> 2)
+		if 1+n > len(b) {
+			return nil
+		}
+		return b[1 : 1+n]
+	case 3: // fat
+		if len(b) < 12 {
+			return nil
+		}
+		hdr := int(le16(b)>>12) * 4
+		n := int(le32(b[4:]))
+		if hdr < 12 || n < 0 || hdr+n > len(b) || n > 16<<20 {
+			return nil
+		}
+		return b[hdr : hdr+n]
+	}
+	return nil
+}
+
+// ldcBefore reports the int constant loaded by an ldc.i4* instruction that
+// ends exactly at code[end]. A byte-pattern heuristic: it does not decode the
+// whole instruction stream, but it is only consulted right before a call to a
+// specific method token, where a false match is very unlikely.
+// Every plausible reading is returned, because without full decoding the
+// byte before a call can be ambiguous.
+type ldc struct{ val, size int }
+
+func ldcBefore(code []byte, end int) []ldc {
+	var out []ldc
+	if end >= 2 && code[end-2] == 0x1F { // ldc.i4.s <int8>
+		out = append(out, ldc{int(int8(code[end-1])), 2})
+	}
+	if end >= 5 && code[end-5] == 0x20 { // ldc.i4 <int32>
+		out = append(out, ldc{int(int32(le32(code[end-4:]))), 5})
+	}
+	if end >= 1 && code[end-1] >= 0x15 && code[end-1] <= 0x1E { // ldc.i4.m1 .. ldc.i4.8
+		out = append(out, ldc{int(code[end-1]) - 0x16, 1})
+	}
+	return out
+}
+
+// callsWithStartupFolder looks for GetFolderPath(SpecialFolder.Startup=7 or
+// CommonStartup=24), for both the 1-argument and the (folder, option) overload.
+func callsWithStartupFolder(code []byte, targets map[uint32]bool) bool {
+	isStartup := func(v int) bool { return v == 7 || v == 24 }
+	for i := 0; i+5 <= len(code); i++ {
+		if code[i] != 0x28 || !targets[le32(code[i+1:])] { // call <token>
+			continue
+		}
+		for _, a := range ldcBefore(code, i) {
+			if isStartup(a.val) {
+				return true
+			}
+			for _, b := range ldcBefore(code, i-a.size) { // (folder, option): folder is loaded first
+				if isStartup(b.val) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }

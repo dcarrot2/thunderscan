@@ -1,8 +1,11 @@
 package main
 
 import (
+	"encoding/base64"
+	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -14,10 +17,11 @@ type signals struct {
 	pinvoke []string        // P/Invoke + native import function names
 	strs    []string        // user strings / extracted literals
 	lower   []string
+	il      map[string]bool // facts found by scanning method bodies (see dotnet.go)
 }
 
 func newSignals() *signals {
-	return &signals{types: map[string]bool{}, members: map[string]bool{}, idents: map[string]bool{}}
+	return &signals{types: map[string]bool{}, members: map[string]bool{}, idents: map[string]bool{}, il: map[string]bool{}}
 }
 
 func (s *signals) addStrings(xs []string) {
@@ -38,6 +42,12 @@ type rule struct {
 	Strings []string // case-insensitive substring of string literals
 	Idents  []string // exact identifier in the #Strings heap
 	TextToo bool     // also apply Strings to plain-text files (configs, scripts)
+
+	// Matchers for code that splits or hides its strings.
+	Exact  []string   // a whole string literal equals this (case-insensitive; ", Assembly" suffix ignored)
+	Suffix []string   // a string literal ends with this (case-insensitive)
+	AllOf  [][]string // every part of one group appears in some literal (parts may be in different literals)
+	IL     []string   // fact keys from method-body scanning
 }
 
 var rules = []rule{
@@ -62,12 +72,25 @@ var rules = []rule{
 	{ID: "BASE64_DECODE", Sev: Low, Title: "Decodes Base64",
 		Why:     "Common and usually harmless, but also used to hide payloads/URLs.",
 		Members: []string{"System.Convert::FromBase64String"}},
+	{ID: "DECODED_STRINGS", Sev: Low, Title: "Contains text hidden with Base64 / XOR",
+		Why:     "These strings were only readable after decoding (shown with a [base64] tag). Other findings may be based on them.",
+		Strings: []string{"[base64] ", "[base64+xor"}},
 	{ID: "CRYPTO", Sev: Low, Title: "Uses symmetric encryption",
 		Why:   "Unusual in game mods; can be used to decrypt hidden payloads.",
 		Types: []string{"System.Security.Cryptography.RijndaelManaged", "System.Security.Cryptography.Aes", "System.Security.Cryptography.AesManaged", "System.Security.Cryptography.AesCryptoServiceProvider", "System.Security.Cryptography.DESCryptoServiceProvider", "System.Security.Cryptography.TripleDESCryptoServiceProvider", "System.Security.Cryptography.RC2CryptoServiceProvider"}},
 	{ID: "REFLECTION_EVASION", Sev: High, Title: "Sensitive APIs named in string literals",
 		Why:     "Dangerous type/DLL names appearing as strings suggests they are resolved via reflection to hide them from scanners.",
 		Strings: []string{"System.Diagnostics.Process", "System.Net.WebClient", "System.Net.Http.HttpClient", "System.Reflection.Assembly", "Microsoft.Win32.Registry", "kernel32", "ntdll", "advapi32", "urlmon"}},
+	{ID: "TYPE_BY_NAME", Sev: Info, Title: "Looks up types by name at runtime",
+		Why:     "Type.GetType(\"…\") resolves a type from a string. Common in mods for optional compatibility; also how code hides which APIs it uses.",
+		Members: []string{"System.Type::GetType", "System.Reflection.Assembly::GetType", "System.Type::GetTypeFromProgID", "System.Type::GetTypeFromCLSID"}},
+	{ID: "REFLECTION_INVOKE", Sev: Info, Title: "Calls methods or creates objects via reflection",
+		Why:     "MethodInfo.Invoke / Activator.CreateInstance run code chosen at runtime.",
+		Members: []string{"System.Reflection.MethodBase::Invoke", "System.Activator::CreateInstance", "System.Type::InvokeMember", "System.Delegate::DynamicInvoke"}},
+	{ID: "SENSITIVE_NAME_PARTS", Sev: Low, Title: "Fragments of sensitive API names as strings",
+		Why: "Short names like \"Process\" or \"WebClient\" as standalone strings are typically glued into a full type name at runtime.",
+		Exact: []string{"Process", "ProcessStartInfo", "WebClient", "HttpClient", "WebRequest", "HttpWebRequest", "TcpClient", "Registry", "RegistryKey",
+			"System.Diagnostics", "Diagnostics", "System.Net", "Microsoft.Win32", "URLDownloadToFile", "UploadString", "UploadData", "UploadValues", "DownloadData", "DownloadString", "DownloadFile"}},
 
 	// ---- memory / injection ----
 	{ID: "PROCESS_INJECTION", Sev: Critical, Title: "Process injection APIs",
@@ -119,6 +142,15 @@ var rules = []rule{
 		Why:     "Disabling or excluding paths from Defender is a strong malware indicator.",
 		Strings: []string{"Add-MpPreference", "Set-MpPreference", "DisableRealtimeMonitoring", "ExclusionPath", "Windows Defender\\Exclusions"},
 		TextToo: true},
+	{ID: "STARTUP_FOLDER", Sev: Critical, Title: "Gets the Windows Startup folder",
+		Why: "Environment.GetFolderPath(SpecialFolder.Startup / CommonStartup) — anything written there runs at every logon. Found in the method code, so it can't be hidden by avoiding path strings.",
+		IL:  []string{"GETFOLDERPATH_STARTUP"}},
+	{ID: "FILE_WRITE", Sev: Low, Title: "Writes, copies or moves files",
+		Why:     "Normal for configs and saves; matters when combined with launching programs or executable file names.",
+		Members: []string{"System.IO.File::WriteAllBytes", "System.IO.File::Copy", "System.IO.File::Move", "System.IO.File::OpenWrite", "System.IO.File::Create", "System.IO.FileInfo::CopyTo", "System.IO.FileInfo::MoveTo"}},
+	{ID: "EXECUTABLE_NAME", Sev: Low, Title: "Mentions an executable or script file name",
+		Why:    "A literal ending in .exe/.bat/.ps1/… — fine in a launcher, suspicious next to file writes.",
+		Suffix: []string{".exe", ".scr", ".bat", ".cmd", ".ps1", ".vbs", ".hta", ".lnk"}},
 
 	// ---- credential theft / exfiltration ----
 	{ID: "CREDENTIAL_PATHS", Sev: Critical, Title: "References browser / Discord / Steam / wallet secrets",
@@ -126,6 +158,10 @@ var rules = []rule{
 		Strings: []string{"Local Storage\\leveldb", "Local Storage/leveldb", "\\Login Data", "Login Data For Account", "\\Network\\Cookies", "Local State", "User Data\\Default",
 			"Mozilla\\Firefox\\Profiles", "logins.json", "key4.db", "loginusers.vdf", "\\ssfn", "config\\config.vdf",
 			"wallet.dat", "Exodus\\exodus.wallet", "\\Electrum\\wallets", "nkbihfbeogaeaoehlefnkodbefgpgknn", "Atomic\\Local Storage", "discordcanary", "discordptb", "dQw4w9WgXcQ:"}},
+	{ID: "CREDENTIAL_PATH_PARTS", Sev: Critical, Title: "Builds browser / Discord / wallet secret paths from pieces",
+		Why: "The parts of an info-stealer path appear as separate strings (e.g. joined with Path.Combine). Splitting them is itself an evasion trick.",
+		AllOf: [][]string{{"Local Storage", "leveldb"}, {"User Data", "Login Data"}, {"User Data", "Cookies"}, {"Mozilla", "Firefox", "Profiles"},
+			{"Steam", "ssfn"}, {"Steam", "loginusers"}, {"Exodus", "exodus.wallet"}, {"Electrum", "wallets"}}},
 	{ID: "DPAPI_DECRYPT", Sev: Critical, Title: "Decrypts DPAPI-protected secrets",
 		Why:     "CryptUnprotectData / ProtectedData.Unprotect is how stealers decrypt browser passwords and cookies.",
 		Members: []string{"System.Security.Cryptography.ProtectedData::Unprotect"}, PInvoke: []string{"CryptUnprotectData", "BCryptDecrypt"}},
@@ -206,6 +242,47 @@ func matchRule(r *rule, s *signals, textOnly bool) []string {
 				}
 			}
 		}
+		for _, k := range r.IL {
+			if s.il[k] {
+				add(ilEvidence[k])
+			}
+		}
+		for _, want := range r.Exact {
+			w := strings.ToLower(want)
+			for i, l := range s.lower {
+				l = strings.TrimSpace(l)
+				if c := strings.IndexByte(l, ','); c >= 0 {
+					l = strings.TrimSpace(l[:c])
+				}
+				if l == w {
+					add(strconv.Quote(s.strs[i]))
+					break
+				}
+			}
+		}
+		for _, suf := range r.Suffix {
+			for i, l := range s.lower {
+				if strings.HasSuffix(strings.TrimSpace(l), suf) && len(l) <= 260 {
+					add(strconv.Quote(s.strs[i]))
+					break
+				}
+			}
+		}
+		for _, group := range r.AllOf {
+			var parts []string
+			for _, part := range group {
+				pl := strings.ToLower(part)
+				for i, l := range s.lower {
+					if strings.Contains(l, pl) {
+						parts = append(parts, snippet(s.strs[i], strings.Index(l, pl), len(pl)))
+						break
+					}
+				}
+			}
+			if len(parts) == len(group) {
+				add(strings.Join(parts, " + "))
+			}
+		}
 	}
 	if !textOnly || r.TextToo {
 		for _, needle := range r.Strings {
@@ -261,6 +338,93 @@ var combos = []combo{
 	{ID: "FINGERPRINT_AND_SEND", Sev: High, Title: "Collects identity info AND has network access",
 		Why: "May be sending user/machine info to a remote server.",
 		All: [][]string{{"USER_IDENTITY", "WMI", "IP_LOOKUP"}, {"NETWORK_RAW", "NETWORK_UNITY"}}},
+	{ID: "HIDDEN_REFLECTIVE_CALL", Sev: High, Title: "Resolves types by name AND invokes them, with hidden or sensitive names",
+		Why: "Type.GetType + Invoke/CreateInstance together with API-name fragments or decoded strings is how code calls Process/WebClient without referencing them.",
+		All: [][]string{{"TYPE_BY_NAME"}, {"REFLECTION_INVOKE"}, {"SENSITIVE_NAME_PARTS", "REFLECTION_EVASION", "DECODED_STRINGS"}}},
+	{ID: "DROP_AND_EXECUTE", Sev: Critical, Title: "Writes files AND launches programs",
+		Why: "Writing a file to disk and then starting a program is the classic dropper pattern.",
+		All: [][]string{{"FILE_WRITE"}, {"PROCESS_START", "NATIVE_EXEC", "HIDDEN_REFLECTIVE_CALL"}}},
+	{ID: "WRITES_EXECUTABLE", Sev: High, Title: "Writes files AND names an executable/script file",
+		Why: "May be dropping an .exe/.bat/.ps1 to disk.",
+		All: [][]string{{"FILE_WRITE"}, {"EXECUTABLE_NAME"}}},
+	{ID: "STARTUP_DROP", Sev: Critical, Title: "Gets the Startup folder AND writes files",
+		Why: "Writing into the Startup folder makes something run at every logon (persistence).",
+		All: [][]string{{"STARTUP_FOLDER"}, {"FILE_WRITE"}}},
+}
+
+var ilEvidence = map[string]string{
+	"GETFOLDERPATH_STARTUP": "Environment.GetFolderPath(SpecialFolder.Startup or CommonStartup)",
+}
+
+// decodeHidden tries to reveal strings hidden with Base64 (optionally XOR'd
+// with a single byte). Results are prefixed so evidence shows they were decoded.
+func decodeHidden(strs []string) []string {
+	var out []string
+	for _, x := range strs {
+		x = strings.TrimSpace(x)
+		if len(x) < 16 || len(x) > 1<<16 || !b64Re.MatchString(x) {
+			continue
+		}
+		b, err := base64.StdEncoding.DecodeString(x)
+		if err != nil {
+			if b, err = base64.RawStdEncoding.DecodeString(strings.TrimRight(x, "=")); err != nil {
+				continue
+			}
+		}
+		if mostlyPrintable(b) {
+			out = append(out, "[base64] "+string(b))
+			continue
+		}
+		// Several keys can give printable text (e.g. 0x20 only flips letter
+		// case), so keep the key whose output looks most like paths/URLs/prose.
+		bestK, bestScore, bestY := 0, -1, []byte(nil)
+		for k := 1; k < 256; k++ {
+			y := make([]byte, len(b))
+			for i := range b {
+				y[i] = b[i] ^ byte(k)
+			}
+			if !mostlyPrintable(y) {
+				continue
+			}
+			if sc := textScore(y); sc > bestScore {
+				bestK, bestScore, bestY = k, sc, y
+			}
+		}
+		if bestY != nil {
+			out = append(out, fmt.Sprintf("[base64+xor 0x%02X] %s", bestK, bestY))
+		}
+	}
+	return out
+}
+
+var b64Re = regexp.MustCompile(`^[A-Za-z0-9+/]+={0,2}$`)
+
+func textScore(b []byte) int {
+	n := 0
+	for _, c := range b {
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+			n += 2
+		case c == '/' || c == '.' || c == ':' || c == '\\' || c == ' ' || c == '_' || c == '-':
+			n += 2
+		case c >= 'A' && c <= 'Z':
+			n++
+		}
+	}
+	return n
+}
+
+func mostlyPrintable(b []byte) bool {
+	if len(b) < 8 {
+		return false
+	}
+	n := 0
+	for _, c := range b {
+		if (c >= 0x20 && c < 0x7F) || c == '\n' || c == '\r' || c == '\t' {
+			n++
+		}
+	}
+	return n*100 >= len(b)*97
 }
 
 func applyRules(rep *Report, file string, s *signals, textOnly bool) {
@@ -290,6 +454,7 @@ func applyRules(rep *Report, file string, s *signals, textOnly bool) {
 			parts = append(parts, hit)
 		}
 		if ok {
+			fired[c.ID] = true // later combos may build on earlier ones
 			rep.add(c.Sev, c.ID, file, c.Title, c.Why, "combination of: "+strings.Join(parts, " + "))
 		}
 	}

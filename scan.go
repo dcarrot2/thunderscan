@@ -4,8 +4,11 @@ import (
 	"archive/zip"
 	"bufio"
 	"bytes"
+	"compress/flate"
+	"compress/gzip"
 	"crypto/sha256"
 	"debug/pe"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -226,6 +229,11 @@ func (s *scanner) checkManifest(r *Report, data []byte) {
 }
 
 func (s *scanner) analyzePE(r *Report, fi *FileInfo, data []byte, base string) {
+	s.analyzePEAt(r, fi, data, base, 0)
+}
+
+// analyzePEAt is analyzePE with the nesting depth of embedded assemblies.
+func (s *scanner) analyzePEAt(r *Report, fi *FileInfo, data []byte, base string, depth int) {
 	f, err := pe.NewFile(bytes.NewReader(data))
 	if err != nil {
 		fi.Kind = "PE(malformed)"
@@ -288,6 +296,10 @@ func (s *scanner) analyzePE(r *Report, fi *FileInfo, data []byte, base string) {
 		}
 		sg.pinvoke = append(sg.pinvoke, meta.PInvokes...)
 		sg.addStrings(meta.UserStrings)
+		sg.addStrings(decodeHidden(meta.UserStrings))
+		for k := range meta.ILFacts {
+			sg.il[k] = true
+		}
 		if len(meta.PInvokes) > 0 {
 			mods := uniq(meta.ModuleRefs)
 			r.add(Info, "PINVOKE", fi.Path, "Calls native Windows/library functions (P/Invoke)", "", "modules: "+strings.Join(mods, ", "))
@@ -300,11 +312,20 @@ func (s *scanner) analyzePE(r *Report, fi *FileInfo, data []byte, base string) {
 					fmt.Sprintf("%d KB, entropy %.2f bits/byte", len(meta.ResourcesData)>>10, e))
 			}
 		}
+		costura := false
 		for _, id := range meta.StringHeap {
 			if strings.HasPrefix(strings.ToLower(id), "costura") {
-				r.add(Info, "COSTURA", fi.Path, "Bundles embedded dependency DLLs (Costura.Fody)", "The embedded DLLs are compressed and were NOT scanned.")
+				costura = true
 				break
 			}
+		}
+		found := s.scanResources(r, fi.Path, meta.ResourcesData, depth)
+		switch {
+		case costura && found > 0:
+			r.add(Info, "COSTURA", fi.Path, "Bundles embedded dependency DLLs (Costura.Fody)", fmt.Sprintf("%d embedded binaries were unpacked and scanned (listed as %s!/resource#N).", found, path.Base(fi.Path)))
+		case costura:
+			r.add(Low, "COSTURA", fi.Path, "Bundles embedded dependency DLLs (Costura.Fody), but none could be unpacked",
+				"The embedded DLLs may use a format this tool doesn't read (e.g. encrypted), so they were NOT scanned.")
 		}
 	}
 	if len(nativeImports) > 0 {
@@ -313,6 +334,67 @@ func (s *scanner) analyzePE(r *Report, fi *FileInfo, data []byte, base string) {
 	}
 	applyRules(r, fi.Path, sg, false)
 	s.checkEmbedded(r, fi.Path, data)
+}
+
+// scanResources walks a .NET assembly's managed resources (each stored as a
+// 4-byte length + bytes) and scans any that are, or inflate/gunzip to, a PE
+// file — this is how Costura.Fody and many loaders embed DLLs. It returns how
+// many embedded binaries were scanned.
+func (s *scanner) scanResources(r *Report, owner string, res []byte, depth int) int {
+	if depth >= 2 || len(res) == 0 {
+		return 0
+	}
+	found := 0
+	for i, p := 0, 0; p+4 <= len(res) && i < 4096; i++ {
+		n := int(binary.LittleEndian.Uint32(res[p:]))
+		p += 4
+		if n < 0 || n > len(res)-p {
+			break
+		}
+		chunk := res[p : p+n]
+		p += n
+		bin, how := s.unpackPE(chunk)
+		if bin == nil {
+			continue
+		}
+		found++
+		name := fmt.Sprintf("%s!/resource#%d", owner, i)
+		sum := sha256.Sum256(bin)
+		fi := FileInfo{Path: name, Size: int64(len(bin)), SHA256: hex.EncodeToString(sum[:])}
+		r.add(Info, "EMBEDDED_PE_SCANNED", name, "Embedded binary unpacked and scanned", "Stored "+how+" inside "+path.Base(owner)+".")
+		s.analyzePEAt(r, &fi, bin, path.Base(name), depth+1)
+		r.Files = append(r.Files, fi)
+	}
+	return found
+}
+
+func (s *scanner) unpackPE(chunk []byte) ([]byte, string) {
+	isPE := func(b []byte) bool { return len(b) > 64 && b[0] == 'M' && b[1] == 'Z' }
+	if isPE(chunk) {
+		return chunk, "uncompressed"
+	}
+	limit := s.opts.maxBytes
+	if limit > 64<<20 { // embedded DLLs are small; don't let a hostile stream inflate to the full file limit
+		limit = 64 << 20
+	}
+	read := func(rc io.Reader) []byte {
+		b, err := io.ReadAll(io.LimitReader(rc, limit))
+		if err != nil && len(b) < 64 {
+			return nil
+		}
+		return b
+	}
+	if len(chunk) > 2 && chunk[0] == 0x1F && chunk[1] == 0x8B {
+		if zr, err := gzip.NewReader(bytes.NewReader(chunk)); err == nil {
+			if b := read(zr); isPE(b) {
+				return b, "gzip-compressed"
+			}
+		}
+	}
+	if b := read(flate.NewReader(bytes.NewReader(chunk))); isPE(b) {
+		return b, "deflate-compressed"
+	}
+	return nil, ""
 }
 
 func (s *scanner) checkEmbedded(r *Report, file string, data []byte) {

@@ -54,6 +54,13 @@ You can also drag a zip onto `thunderscan.exe` in Explorer. The window stays ope
   - known obfuscators and ConfuserEx-style invisible names
   - embedded executables, mixed-mode native code
   - embedded URLs and hard-coded IP addresses
+  - code written to dodge the rules above:
+    - Startup-folder persistence via `Environment.GetFolderPath(SpecialFolder.Startup)`, found by scanning method bodies (IL), so no path string is needed
+    - stealer paths split into pieces (`Path.Combine("Local Storage", "leveldb")`)
+    - strings hidden with Base64 or Base64 + single-byte XOR (decoded, then checked by every rule)
+    - `Type.GetType` + `Invoke`/`CreateInstance` with API-name fragments like `"Process"` or `"WebClient"`
+    - file writes combined with launching programs or executable file names
+  - embedded DLLs (Costura.Fody and similar: raw, deflate or gzip resources) are unpacked and scanned like any other DLL
 - **Native DLLs:** imports and strings, plus DLL-hijack names like `winhttp.dll` or `version.dll`.
 - **Package structure:**
   - zip-slip (`..`) paths, zip bombs, nested archives
@@ -69,7 +76,7 @@ Findings for the official `BepInEx` / `LavaGang` packages, and for known BepInEx
 
 ## Limits
 
-This is static analysis. A clean result means no known red flags were found, not that the mod is safe. Code can be hidden in compressed resources, downloaded later, or written to dodge these rules. For anything rated HIGH or CRITICAL, open the DLL in [ILSpy](https://github.com/icsharpcode/ILSpy) or dnSpy and read the flagged code before installing.
+This is static analysis. A clean result means no known red flags were found, not that the mod is safe. Code can be encrypted inside resources, downloaded later, or written to dodge these rules (for example multi-byte XOR, strings built character by character, or a custom packer). For anything rated HIGH or CRITICAL, open the DLL in [ILSpy](https://github.com/icsharpcode/ILSpy) or dnSpy and read the flagged code before installing.
 
 ## Build
 
