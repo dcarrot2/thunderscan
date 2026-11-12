@@ -1,3 +1,4 @@
 *.exe
 /thunderscan
 .DS_Store
+/SHA256SUMS.txt
