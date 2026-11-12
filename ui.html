@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thunderscan</title>
+<style>
+:root{
+  --bg:#f6f7f9;--card:#fff;--fg:#1b1f24;--muted:#5d6670;--line:#dde1e6;--accent:#2f6fde;
+  --crit:#b3261e;--crit-bg:#fde7e6;--high:#c4410c;--high-bg:#fdebdd;--med:#8a6100;--med-bg:#fbf1d6;
+  --low:#1f6f8b;--low-bg:#e2f1f6;--info:#5d6670;--info-bg:#eceff2;--ok:#1d7a3e;--ok-bg:#e1f4e7;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#14171b;--card:#1d2126;--fg:#e6e9ec;--muted:#9aa4ae;--line:#30363d;--accent:#6ea2ff;
+  --crit:#ff8a80;--crit-bg:#4a1c1a;--high:#ffab70;--high-bg:#45281a;--med:#f2cc60;--med-bg:#3d3214;
+  --low:#7cc7e0;--low-bg:#173540;--info:#9aa4ae;--info-bg:#262b31;--ok:#7ad69a;--ok-bg:#17351f;
+}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:980px;margin:0 auto;padding:24px 16px 64px}
+header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px}
+h1{font-size:20px;margin:0}
+h1 small{font-weight:400;color:var(--muted);font-size:13px;margin-left:8px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:16px}
+label.h{display:block;font-weight:600;margin-bottom:6px}
+textarea{width:100%;min-height:110px;resize:vertical;font:13px/1.45 ui-monospace,Consolas,monospace;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg)}
+.hint{color:var(--muted);font-size:12.5px;margin:6px 0 0}
+.drop{margin-top:12px;border:2px dashed var(--line);border-radius:8px;padding:14px;text-align:center;color:var(--muted);cursor:pointer}
+.drop.over{border-color:var(--accent);color:var(--accent)}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.chip{background:var(--info-bg);border-radius:999px;padding:2px 10px;font-size:12.5px;display:inline-flex;gap:6px;align-items:center}
+.chip button{border:0;background:none;color:var(--muted);cursor:pointer;padding:0;font-size:14px}
+.row{display:flex;flex-wrap:wrap;gap:16px;align-items:center;margin-top:14px}
+.row input[type=password]{padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);width:260px;max-width:100%}
+button.primary{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:9px 20px;font-weight:600;font-size:14px;cursor:pointer}
+button.primary:disabled{opacity:.6;cursor:wait}
+button.ghost{background:none;border:1px solid var(--line);color:var(--muted);border-radius:8px;padding:6px 12px;cursor:pointer}
+.status{color:var(--muted)}
+.spin{display:inline-block;width:14px;height:14px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:s 1s linear infinite;vertical-align:-2px;margin-right:6px}
+@keyframes s{to{transform:rotate(360deg)}}
+.summary{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}
+.pill{display:inline-block;border-radius:6px;padding:1px 8px;font-size:12px;font-weight:700;letter-spacing:.02em;white-space:nowrap}
+.CRITICAL{color:var(--crit);background:var(--crit-bg)}.HIGH{color:var(--high);background:var(--high-bg)}
+.MEDIUM{color:var(--med);background:var(--med-bg)}.LOW{color:var(--low);background:var(--low-bg)}
+.INFO{color:var(--info);background:var(--info-bg)}.OK{color:var(--ok);background:var(--ok-bg)}
+.rep h2{font-size:16px;margin:0 0 4px;word-break:break-all}
+.verdict{border-radius:8px;padding:10px 12px;margin:10px 0;font-weight:600}
+.meta{color:var(--muted);font-size:13px}
+.meta a{color:var(--accent)}
+.f{border-top:1px solid var(--line);padding:10px 0}
+.f .t{font-weight:600}
+.f .file{font:12.5px ui-monospace,Consolas,monospace;color:var(--muted);word-break:break-all}
+.f .why{color:var(--muted);font-size:13px;margin-top:2px}
+.f ul{margin:4px 0 0;padding-left:18px;font:12.5px ui-monospace,Consolas,monospace;word-break:break-all}
+details{margin-top:8px}
+summary{cursor:pointer;color:var(--muted)}
+.mono{font:12px ui-monospace,Consolas,monospace;word-break:break-all}
+table{border-collapse:collapse;width:100%}
+td{padding:3px 6px;border-top:1px solid var(--line);vertical-align:top}
+.err{color:var(--crit);background:var(--crit-bg);border-radius:8px;padding:8px 12px;margin-bottom:8px}
+.toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:8px;flex-wrap:wrap}
+</style>
+</head>
+<body>
+<main>
+<header>
+  <h1>Thunderscan <small>static security check for Thunderstore mods</small></h1>
+  <button class="ghost" id="quit" title="Stop the scanner">Quit</button>
+</header>
+
+<div class="card">
+  <label class="h" for="targets">Packages to scan</label>
+  <textarea id="targets" spellcheck="false" placeholder="One per line, e.g.
+notnotnotswipez-MoreCompany
+Owner-ModName-1.2.3
+https://thunderstore.io/c/lethal-company/p/Owner/ModName/
+C:\Users\you\AppData\Roaming\r2modmanPlus-local\LethalCompany\profiles\Default\BepInEx\plugins"></textarea>
+  <p class="hint">Package names or thunderstore.io links are downloaded and scanned without being installed. Local zips, DLLs or whole mod folders (r2modman profiles) also work.</p>
+  <div class="drop" id="drop">Drop .zip / .dll files here or click to choose</div>
+  <input type="file" id="file" multiple hidden accept=".zip,.dll,.exe">
+  <div class="chips" id="chips"></div>
+  <div class="row">
+    <label><input type="checkbox" id="deps"> Also scan dependencies</label>
+    <label title="Only SHA-256 hashes are sent, never your files. Free key at virustotal.com.">VirusTotal key (optional): <input type="password" id="vtkey" autocomplete="off" placeholder="hash lookup only"></label>
+  </div>
+  <div class="row">
+    <button class="primary" id="go">Scan</button>
+    <span class="status" id="status"></span>
+  </div>
+</div>
+
+<div id="out"></div>
+<p class="hint">Static analysis highlights risky capabilities; it can't prove a mod is safe. Decompile anything flagged HIGH or CRITICAL with ILSpy/dnSpy before trusting it.</p>
+</main>
+
+<script>
+(() => {
+const token = new URLSearchParams(location.search).get("t") || "";
+const $ = id => document.getElementById(id);
+const SEV = ["INFO","LOW","MEDIUM","HIGH","CRITICAL"];
+let files = [];
+let showInfo = false;
+let last = null;
+
+// All mod-supplied text is inserted with textContent – never innerHTML.
+function el(tag, attrs, ...kids){
+  const e = document.createElement(tag);
+  for (const [k,v] of Object.entries(attrs||{})) {
+    if (k === "class") e.className = v; else if (k === "text") e.textContent = v; else e.setAttribute(k, v);
+  }
+  for (const k of kids) if (k != null) e.append(k.nodeType ? k : document.createTextNode(String(k)));
+  return e;
+}
+function safeLink(u, text){
+  try { const p = new URL(u); if (p.protocol === "https:" || p.protocol === "http:") return el("a",{href:p.href,target:"_blank",rel:"noopener noreferrer",text:text||p.href}); } catch {}
+  return el("span",{text:text||u});
+}
+
+function renderChips(){
+  const c = $("chips"); c.replaceChildren();
+  files.forEach((f,i) => {
+    const b = el("button",{title:"remove",text:"×"}); b.onclick = () => { files.splice(i,1); renderChips(); };
+    c.append(el("span",{class:"chip"}, f.name, b));
+  });
+}
+const drop = $("drop"), fileIn = $("file");
+drop.onclick = () => fileIn.click();
+fileIn.onchange = () => { files.push(...fileIn.files); fileIn.value = ""; renderChips(); };
+drop.ondragover = e => { e.preventDefault(); drop.classList.add("over"); };
+drop.ondragleave = () => drop.classList.remove("over");
+drop.ondrop = e => { e.preventDefault(); drop.classList.remove("over"); files.push(...e.dataTransfer.files); renderChips(); };
+
+try { $("targets").value = localStorage.getItem("ts.targets") || ""; $("deps").checked = localStorage.getItem("ts.deps") === "1"; } catch {}
+
+$("go").onclick = async () => {
+  const targets = $("targets").value;
+  if (!targets.trim() && !files.length) { $("status").textContent = "Enter a package or add a file first."; return; }
+  try { localStorage.setItem("ts.targets", targets); localStorage.setItem("ts.deps", $("deps").checked ? "1":"0"); } catch {}
+  const fd = new FormData();
+  fd.append("targets", targets);
+  fd.append("deps", $("deps").checked ? "1" : "0");
+  fd.append("vtkey", $("vtkey").value);
+  files.forEach(f => fd.append("files", f, f.name));
+  $("go").disabled = true;
+  $("status").replaceChildren(el("span",{class:"spin"}), $("vtkey").value ? "Scanning… (VirusTotal lookups are rate-limited, this can take a while)" : "Downloading and scanning…");
+  try {
+    const res = await fetch("/api/scan", {method:"POST", body:fd, headers:{"X-Token":token}});
+    if (!res.ok) throw new Error(await res.text());
+    last = await res.json();
+    render();
+    $("status").textContent = "Done.";
+  } catch (e) {
+    $("status").textContent = "Error: " + e.message;
+  } finally { $("go").disabled = false; }
+};
+
+$("quit").onclick = async () => {
+  await fetch("/api/quit",{method:"POST",headers:{"X-Token":token}}).catch(()=>{});
+  document.body.replaceChildren(el("main",{}, el("p",{text:"Thunderscan stopped. You can close this tab."})));
+};
+
+function render(){
+  const out = $("out"); out.replaceChildren();
+  if (!last) return;
+  for (const e of last.errors || []) out.append(el("div",{class:"err",text:e}));
+  const reps = last.reports || [];
+  if (!reps.length) return;
+
+  const tb = el("div",{class:"toolbar"});
+  const sum = el("div",{class:"summary"});
+  const counts = {};
+  reps.forEach(r => { const k = r.max_severity === "INFO" ? "OK" : r.max_severity; counts[k] = (counts[k]||0)+1; });
+  for (const k of ["CRITICAL","HIGH","MEDIUM","LOW","OK"]) if (counts[k]) sum.append(el("span",{class:"pill "+k,text:`${counts[k]} × ${k==="OK"?"no flags":k}`}));
+  const tog = el("label",{}, el("input",{type:"checkbox"}), " show INFO findings");
+  tog.firstChild.checked = showInfo;
+  tog.firstChild.onchange = e => { showInfo = e.target.checked; render(); };
+  tb.append(sum, tog);
+  out.append(tb);
+
+  [...reps].sort((a,b) => SEV.indexOf(b.max_severity) - SEV.indexOf(a.max_severity) || b.risk_score - a.risk_score)
+    .forEach(r => out.append(renderReport(r)));
+}
+
+function renderReport(r){
+  const sevKey = r.max_severity === "INFO" ? "OK" : r.max_severity;
+  const card = el("div",{class:"card rep"});
+  card.append(el("h2",{text:r.target}));
+
+  const m = r.thunderstore;
+  if (m) {
+    const meta = el("div",{class:"meta"});
+    meta.append(safeLink(m.package_url, "Thunderstore page"), ` · ${m.owner} · v${m.version}`);
+    if (m.latest_version && m.latest_version !== m.version) meta.append(` (latest ${m.latest_version})`);
+    meta.append(` · ${Number(m.version_downloads).toLocaleString()} downloads · created ${m.package_created} · uploaded ${m.version_created}`);
+    if (m.website_url) meta.append(" · ", safeLink(m.website_url, "source/website"));
+    if (m.review_status && m.review_status.length) meta.append(" · review: " + m.review_status.join(", "));
+    card.append(meta);
+  } else if (r.manifest) {
+    card.append(el("div",{class:"meta",text:`manifest: ${r.manifest.name} v${r.manifest.version_number}`}));
+  }
+
+  card.append(el("div",{class:"verdict "+sevKey}, el("span",{class:"pill "+sevKey,text:sevKey==="OK"?"NO FLAGS":sevKey}), " ", r.verdict, ` (score ${r.risk_score})`));
+
+  const fs = (r.findings||[]).filter(f => showInfo || f.severity !== "INFO");
+  if (!fs.length) card.append(el("div",{class:"meta",text:"No findings."}));
+  for (const f of fs) {
+    const d = el("div",{class:"f"});
+    d.append(el("div",{}, el("span",{class:"pill "+f.severity,text:f.severity}), " ", el("span",{class:"t",text:f.title}), " ", el("span",{class:"meta",text:"("+f.rule+")"})));
+    if (f.file) d.append(el("div",{class:"file",text:f.file}));
+    if (f.why) d.append(el("div",{class:"why",text:f.why}));
+    if (f.evidence && f.evidence.length) { const ul = el("ul"); f.evidence.forEach(x => ul.append(el("li",{text:x}))); d.append(ul); }
+    card.append(d);
+  }
+
+  if (r.urls && r.urls.length) {
+    const det = el("details",{}, el("summary",{text:`URLs embedded in binaries (${r.urls.length})`}));
+    const ul = el("ul",{class:"mono"}); r.urls.forEach(u => ul.append(el("li",{text:u}))); det.append(ul);
+    card.append(det);
+  }
+  const bins = (r.files||[]).filter(f => f.kind);
+  const det = el("details",{}, el("summary",{text:`Files (${(r.files||[]).length}, ${bins.length} binaries)`}));
+  const t = el("table",{class:"mono"});
+  for (const f of r.files||[]) {
+    let vt = "";
+    if (f.virustotal) vt = f.virustotal.error ? "VT error" : !f.virustotal.found ? "VT: unknown" : `VT: ${f.virustotal.malicious} mal / ${f.virustotal.suspicious} susp`;
+    t.append(el("tr",{}, el("td",{text:f.kind||""}), el("td",{text:f.path}), el("td",{text:fmtSize(f.size)}), el("td",{text:f.sha256 ? f.sha256.slice(0,16)+"…" : ""}), el("td",{text:vt})));
+  }
+  det.append(t); card.append(det);
+  return card;
+}
+function fmtSize(n){ return n > 1<<20 ? (n/1048576).toFixed(1)+" MB" : n > 1024 ? (n/1024).toFixed(0)+" KB" : n+" B"; }
+})();
+</script>
+</body>
+</html>
